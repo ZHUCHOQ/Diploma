@@ -1,147 +1,267 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import GroupShuffleSplit, cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras.callbacks import EarlyStopping
-import warnings
-warnings.filterwarnings('ignore')
+import joblib
 
 # Загрузка данных
-data = pd.read_csv('/content/drive/MyDrive/DSL-StrongPasswordData.csv')  # Замените на путь к вашему файлу
+df = pd.read_csv('/content/drive/MyDrive/DSL-StrongPasswordData.csv')
+print("Размер датасета:", df.shape)
+print("Уникальные пользователи:", len(df['subject'].unique()))
 
-# Выбор субъекта для метки "свой" (здесь s002)
-own_subject = 's002'
-data['label'] = data['subject'].apply(lambda x: 1 if x == own_subject else 0)
+# 1. ПОДГОТОВКА ДАННЫХ ДЛЯ БИНАРНОЙ КЛАССИФИКАЦИИ
+# Целевой пользователь vs все остальные
+target_user = 's002'
+df['is_target'] = (df['subject'] == target_user).astype(int)
 
-# Создание сбалансированного датасета
-own_data = data[data['label'] == 1]
-other_data = data[data['label'] == 0]
-
-# Исправленная выборка: по 8 случайных записей от каждого чужого субъекта
-other_sampled = other_data.groupby('subject', group_keys=False).apply(lambda x: x.sample(8, random_state=42))
-
-# Объединение данных
-balanced_data = pd.concat([own_data, other_sampled], ignore_index=True)
-
-# Проверка баланса классов
 print("Распределение классов:")
-print(balanced_data['label'].value_counts())
+print(df['is_target'].value_counts())
+print(f"Доля целевого пользователя: {df['is_target'].mean():.3f}")
 
-# Разделение на признаки и метки
-X = balanced_data.drop(['subject', 'sessionIndex', 'rep', 'label'], axis=1)
-y = balanced_data['label']
+# 2. БАЛАНСИРОВКА ДАННЫХ
+# Чтобы избежать дисбаланса, возьмем равное количество примеров от каждого класса
+target_data = df[df['is_target'] == 1]
+non_target_data = df[df['is_target'] == 0].sample(n=len(target_data), random_state=42)
 
-# Нормализация данных
+balanced_df = pd.concat([target_data, non_target_data])
+print(f"\nСбалансированный датасет: {balanced_df.shape}")
+
+# 3. ПОДГОТОВКА ПРИЗНАКОВ И МЕТОК
+features = balanced_df.drop(['subject', 'sessionIndex', 'rep', 'is_target'], axis=1)
+labels = balanced_df['is_target']
+
+# Масштабирование признаков
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+features_scaled = scaler.fit_transform(features)
 
-# Преобразование в 3D-форму для LSTM [samples, timesteps, features]
-X_reshaped = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
+# 4. РАЗДЕЛЕНИЕ ДАННЫХ С СОХРАНЕНИЕМ ГРУПП (ПОЛЬЗОВАТЕЛЕЙ)
+# Важно: разделяем по пользователям, а не случайным образом
+unique_subjects = balanced_df['subject'].unique()
+target_subjects = [target_user]
+non_target_subjects = [s for s in unique_subjects if s != target_user]
 
-# Разделение на train/test
-X_train, X_test, y_train, y_test = train_test_split(
-    X_reshaped, y, test_size=0.2, random_state=42, stratify=y
-)
+# Разделяем нецелевых пользователей на train/test
+np.random.seed(42)
+train_non_target = np.random.choice(non_target_subjects, 
+                                   size=int(0.7 * len(non_target_subjects)), 
+                                   replace=False)
+test_non_target = [s for s in non_target_subjects if s not in train_non_target]
 
-# Упрощенная модель с меньшей регуляризацией
-model = Sequential()
-model.add(LSTM(32, 
-               input_shape=(X_train.shape[1], X_train.shape[2]),
-               kernel_regularizer=l2(0.001),
-               return_sequences=False))
-model.add(Dropout(0.3))
-model.add(Dense(16, activation='relu', kernel_regularizer=l2(0.001)))
-model.add(Dropout(0.3))
-model.add(Dense(1, activation='sigmoid'))
+# Создаем маски для разделения
+train_mask = balanced_df['subject'].isin(list(train_non_target) + [target_user])
+test_mask = balanced_df['subject'].isin(list(test_non_target) + [target_user])
 
-model.compile(loss='binary_crossentropy',
-              optimizer='adam',
-              metrics=['accuracy'])
+X_train = features_scaled[train_mask]
+X_test = features_scaled[test_mask]
+y_train = labels[train_mask]
+y_test = labels[test_mask]
 
-# Ранняя остановка
-early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+print(f"\nРазделение данных:")
+print(f"Обучающая выборка: {X_train.shape[0]} примеров")
+print(f"Тестовая выборка: {X_test.shape[0]} примеров")
+print(f"Целевой класс в train: {y_train.mean():.3f}")
+print(f"Целевой класс в test: {y_test.mean():.3f}")
 
-# Обучение модели
-history = model.fit(X_train, y_train,
-                    epochs=100,
-                    batch_size=16,
-                    validation_split=0.2,
-                    callbacks=[early_stop],
-                    verbose=1)
+# 5. МОДЕЛИ БИНАРНОЙ КЛАССИФИКАЦИИ
+models = {
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
+    'SVM': SVC(kernel='rbf', probability=True, random_state=42, class_weight='balanced')
+}
 
-# Оценка модели
-test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-print(f'Test Accuracy: {test_acc:.4f}')
-print(f'Test Loss: {test_loss:.4f}')
+# 6. ОБУЧЕНИЕ И ОЦЕНКА МОДЕЛЕЙ
+results = {}
 
-# Предсказания
-y_pred_prob = model.predict(X_test)
-y_pred = (y_pred_prob > 0.5).astype("int32")
+for name, model in models.items():
+    print(f"\n{'-'*50}")
+    print(f"Обучение {name}")
+    print('-'*50)
+    
+    # Обучение модели
+    model.fit(X_train, y_train)
+    
+    # Предсказания на тестовой выборке
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]  # Вероятность класса 1 (целевой пользователь)
+    
+    # Оценка качества
+    print(classification_report(y_test, y_pred, target_names=['Нецелевой', 'Целевой']))
+    
+    # Матрица ошибок
+    cm = confusion_matrix(y_test, y_pred)
+    print("Матрица ошибок:")
+    print(cm)
+    
+    # ROC-AUC
+    auc_score = roc_auc_score(y_test, y_pred_proba)
+    print(f"ROC-AUC: {auc_score:.3f}")
+    
+    # Сохранение результатов
+    results[name] = {
+        'model': model,
+        'y_pred': y_pred,
+        'y_pred_proba': y_pred_proba,
+        'auc': auc_score,
+        'confusion_matrix': cm
+    }
 
-# Детальный отчет
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
+# 7. ВЫБОР ЛУЧШЕЙ МОДЕЛИ И АНАЛИЗ
+best_model_name = max(results.keys(), key=lambda x: results[x]['auc'])
+best_model = results[best_model_name]['model']
 
-# Визуализация результатов
-fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+print(f"\n{'='*60}")
+print(f"ЛУЧШАЯ МОДЕЛЬ: {best_model_name}")
+print(f"ROC-AUC: {results[best_model_name]['auc']:.3f}")
+print('='*60)
 
-# График точности
-ax1.plot(history.history['accuracy'], label='Training Accuracy')
-ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
-ax1.set_title('Model Accuracy')
-ax1.set_xlabel('Epoch')
-ax1.set_ylabel('Accuracy')
-ax1.legend()
+# 8. ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ
+plt.figure(figsize=(15, 5))
 
-# График потерь
-ax2.plot(history.history['loss'], label='Training Loss')
-ax2.plot(history.history['val_loss'], label='Validation Loss')
-ax2.set_title('Model Loss')
-ax2.set_xlabel('Epoch')
-ax2.set_ylabel('Loss')
-ax2.legend()
+# Матрица ошибок лучшей модели
+plt.subplot(1, 3, 1)
+cm = results[best_model_name]['confusion_matrix']
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['Нецелевой', 'Целевой'],
+            yticklabels=['Нецелевой', 'Целевой'])
+plt.title(f'Матрица ошибок ({best_model_name})')
+plt.ylabel('Фактический класс')
+plt.xlabel('Предсказанный класс')
 
-# Матрица ошибок
-cm = confusion_matrix(y_test, y_pred)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-disp.plot(ax=ax3)
-ax3.set_title('Confusion Matrix')
+# Важность признаков (для Random Forest)
+plt.subplot(1, 3, 2)
+if hasattr(best_model, 'feature_importances_'):
+    feature_importance = pd.DataFrame({
+        'feature': features.columns,
+        'importance': best_model.feature_importances_
+    }).sort_values('importance', ascending=False).head(15)
+    
+    plt.barh(feature_importance['feature'], feature_importance['importance'])
+    plt.title('Важность признаков (топ-15)')
+    plt.xlabel('Важность')
+else:
+    plt.text(0.5, 0.5, 'Недоступно для этой модели', 
+             ha='center', va='center', transform=plt.gca().transAxes)
+    plt.title('Важность признаков')
 
-# ROC-кривая
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
-roc_auc = auc(fpr, tpr)
-ax4.plot(fpr, tpr, label=f'ROC curve (area = {roc_auc:.2f})')
-ax4.plot([0, 1], [0, 1], 'k--')  # Случайный классификатор
-ax4.set_xlim([0.0, 1.0])
-ax4.set_ylim([0.0, 1.05])
-ax4.set_xlabel('False Positive Rate')
-ax4.set_ylabel('True Positive Rate')
-ax4.set_title('Receiver Operating Characteristic')
-ax4.legend(loc="lower right")
+# Сравнение ROC-AUC всех моделей
+plt.subplot(1, 3, 3)
+model_names = list(results.keys())
+auc_scores = [results[name]['auc'] for name in model_names]
+colors = ['skyblue', 'lightgreen', 'lightcoral']
+
+bars = plt.bar(model_names, auc_scores, color=colors)
+plt.ylim(0, 1)
+plt.title('Сравнение ROC-AUC моделей')
+plt.ylabel('ROC-AUC')
+
+# Добавляем значения на столбцы
+for bar, score in zip(bars, auc_scores):
+    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+             f'{score:.3f}', ha='center', va='bottom')
 
 plt.tight_layout()
 plt.show()
 
-# Анализ важности признаков (на основе весов модели)
-# Получаем веса из первого слоя LSTM
-lstm_weights = model.layers[0].get_weights()[0]
-feature_importance = np.mean(np.abs(lstm_weights), axis=1)
+# 9. ГЛУБОКИЙ АНАЛИЗ ЛУЧШЕЙ МОДЕЛИ
+print(f"\nДЕТАЛЬНЫЙ АНАЛИЗ {best_model_name}:")
 
-# Создаем DataFrame для визуализации
-importance_df = pd.DataFrame({
-    'feature': X.columns,
-    'importance': feature_importance
-}).sort_values('importance', ascending=False)
+# Анализ ошибочных предсказаний
+y_test_values = y_test.values
+best_predictions = results[best_model_name]['y_pred']
+best_probabilities = results[best_model_name]['y_pred_proba']
 
-# Визуализация важности признаков
-plt.figure(figsize=(10, 8))
-sns.barplot(x='importance', y='feature', data=importance_df.head(15))
-plt.title('Top 15 Important Features')
-plt.tight_layout()
-plt.show()
+# Примеры с наибольшей неопределенностью
+uncertain_threshold = 0.4  # Порог неопределенности
+uncertain_mask = (best_probabilities > uncertain_threshold) & (best_probabilities < (1 - uncertain_threshold))
+uncertain_count = uncertain_mask.sum()
+
+print(f"Примеров с неопределенностью (0.4 < p < 0.6): {uncertain_count}/{len(y_test)}")
+
+# Анализ по пользователям (для тестовых данных)
+test_subjects = balanced_df['subject'][test_mask].values
+results_df = pd.DataFrame({
+    'subject': test_subjects,
+    'true_label': y_test_values,
+    'predicted_label': best_predictions,
+    'probability': best_probabilities
+})
+
+# Статистика по пользователям
+user_stats = results_df.groupby('subject').agg({
+    'true_label': 'first',
+    'predicted_label': 'mean',
+    'probability': ['mean', 'std', 'count']
+}).round(3)
+
+print("\nСтатистика по пользователям в тестовой выборке:")
+print(user_stats)
+
+# 10. СОХРАНЕНИЕ ЛУЧШЕЙ МОДЕЛИ
+model_artifacts = {
+    'model': best_model,
+    'scaler': scaler,
+    'feature_names': features.columns.tolist(),
+    'target_user': target_user,
+    'performance': {
+        'auc': results[best_model_name]['auc'],
+        'confusion_matrix': results[best_model_name]['confusion_matrix']
+    }
+}
+
+joblib.dump(model_artifacts, '/content/drive/MyDrive/best_keystroke_binary_model.pkl')
+print(f"\nЛучшая модель сохранена: /content/drive/MyDrive/best_keystroke_binary_model.pkl")
+
+# 11. ФУНКЦИЯ ДЛЯ ПРЕДСКАЗАНИЯ
+def predict_user(model_path, new_keystroke_data):
+    """
+    Функция для предсказания принадлежности пользователя
+    
+    Parameters:
+    - model_path: путь к сохраненной модели
+    - new_keystroke_data: данные ввода пароля (DataFrame или array)
+    
+    Returns:
+    - prediction: 1 если целевой пользователь, 0 если нет
+    - probability: вероятность принадлежности целевому пользователю
+    - confidence: уровень уверенности (высокий/средний/низкий)
+    """
+    artifacts = joblib.load(model_path)
+    model = artifacts['model']
+    scaler = artifacts['scaler']
+    
+    # Масштабирование новых данных
+    if hasattr(new_keystroke_data, 'values'):
+        new_data_scaled = scaler.transform(new_keystroke_data.values)
+    else:
+        new_data_scaled = scaler.transform(new_keystroke_data)
+    
+    # Предсказание
+    probability = model.predict_proba(new_data_scaled)[0, 1]
+    prediction = 1 if probability > 0.5 else 0
+    
+    # Уровень уверенности
+    if probability > 0.8 or probability < 0.2:
+        confidence = "высокий"
+    elif probability > 0.6 or probability < 0.4:
+        confidence = "средний"
+    else:
+        confidence = "низкий"
+    
+    return prediction, probability, confidence
+
+print(f"\n{'='*60}")
+print("ФУНКЦИЯ ДЛЯ ИСПОЛЬЗОВАНИЯ В ПРОДУКШЕНЕ")
+print('='*60)
+print("""
+# Пример использования:
+# prediction, prob, confidence = predict_user(
+#     '/content/drive/MyDrive/best_keystroke_binary_model.pkl',
+#     new_keystroke_data
+# )
+""")
